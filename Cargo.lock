@@ -5616,6 +5616,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.0",
+ "alloy-evm",
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
@@ -5628,6 +5629,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-trie-common",
  "revm-bytecode",
+ "revm-database",
  "revm-database-interface",
  "revm-state",
  "serde",

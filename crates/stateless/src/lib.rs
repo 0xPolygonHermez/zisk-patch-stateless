@@ -53,6 +53,8 @@ pub use validation::stateless_validation_recovered;
 #[doc(inline)]
 pub use validation::stateless_validation_recovered_with_trie;
 #[doc(inline)]
+pub use validation::stateless_validation_recovered_with_pair_roots;
+#[doc(inline)]
 pub use validation::stateless_validation_with_trie;
 
 /// Implementation of stateless validation

@@ -15,6 +15,7 @@
 // limitations under the License.
 use alloc::vec::Vec;
 use core::{cell::RefCell, marker::PhantomData};
+use itertools::Itertools;
 
 use crate::{StatelessTrie, StatelessTrieError, WitnessDbError};
 use alloy_primitives::{
@@ -173,7 +174,9 @@ impl StatelessTrie for SparseState {
     /// Computes the new state root from the HashedPostState.
     fn calculate_state_root(&mut self, state: HashedPostState) -> Result<B256, StatelessTrieError> {
         let mut removed_accounts = Vec::new();
-        for (hashed_address, account) in state.accounts {
+        for (hashed_address, account) in
+            state.accounts.into_iter().sorted_unstable_by_key(|(addr, _)| *addr)
+        {
             // nonexisting accounts must be removed from the state
             let Some(account) = account else {
                 removed_accounts.push(hashed_address);

@@ -6,6 +6,7 @@ use crate::{
 use alloc::{
     collections::BTreeMap,
     fmt::Debug,
+    format,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -22,6 +23,8 @@ use reth_evm::{
     ConfigureEvm,
     execute::{BlockExecutionOutput, Executor},
 };
+use alloy_evm::{Evm, block::BlockExecutor};
+use revm_database::{State, states::bundle_state::BundleRetention};
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use tries::{StatelessTrie, StatelessTrieError, default::StatelessSparseTrie};
@@ -270,6 +273,132 @@ where
         // State::builder().with_bal_builder() + bump_bal_index() + take_built_alloy_bal().
         block_access_list: None,
     })
+}
+
+/// Like [`stateless_validation_recovered_with_trie`], but drives the block
+/// executor TRANSACTION-BY-TRANSACTION and emits the cumulative L2 state root
+/// AFTER each transaction (`tx_roots[i]` = root after tx `i`).
+///
+/// Position B's settlement chains a `StateDelta R_{k-1} -> R_k` per entry; the
+/// prover (P3) needs PROVEN intermediate roots to gate those deltas instead of
+/// trusting the composer. Each cross-chain interaction is its own L2 tx, so the
+/// per-tx root after the user tx IS the per-pair candidate root the composer
+/// posts. (A single tx making several calls maps several entries onto ONE
+/// tx-root; the prover telescopes those intra-tx interiors and gates only the
+/// tx-boundary roots.)
+///
+/// SOUNDNESS GUARD: a mid-execution snapshot omits block-level post-execution
+/// changes (withdrawals, EIP-7002/7251 requests). For eez-dev those are a
+/// structural no-op (no system predeploys, empty withdrawals — see the parity
+/// spike), so `R_k(snapshot) == candidate_k(sealed)`. If the block carries
+/// non-empty requests/withdrawals the assumption breaks: we return an EMPTY
+/// `tx_roots` (the prover then degrades to endpoint-only gating) rather than
+/// emit unsound mid-roots.
+pub fn stateless_validation_recovered_with_pair_roots<T, ChainSpec, E>(
+    current_block: RecoveredBlock<Block>,
+    witness: ExecutionWitness,
+    chain_spec: Arc<ChainSpec>,
+    evm_config: E,
+) -> Result<(B256, Vec<B256>, Vec<bool>), StatelessValidationError>
+where
+    T: StatelessTrie,
+    ChainSpec: Send + Sync + EthChainSpec<Header = Header> + EthereumHardforks + Debug,
+    E: ConfigureEvm<Primitives = EthPrimitives> + Clone + 'static,
+{
+    // ── setup IDENTICAL to stateless_validation_recovered_with_trie ──
+    let mut ancestor_headers: Vec<_> = witness
+        .headers
+        .iter()
+        .map(|bytes| {
+            let hash = keccak256(bytes);
+            alloy_rlp::decode_exact::<Header>(bytes)
+                .map(|h| SealedHeader::new(h, hash))
+                .map_err(|_| StatelessValidationError::HeaderDeserializationFailed)
+        })
+        .collect::<Result<_, _>>()?;
+    ancestor_headers.sort_by_key(|header| header.number());
+    let count = ancestor_headers.len();
+    if count > BLOCKHASH_ANCESTOR_LIMIT {
+        return Err(StatelessValidationError::AncestorHeaderLimitExceeded {
+            count,
+            limit: BLOCKHASH_ANCESTOR_LIMIT,
+        });
+    }
+    let ancestor_hashes = compute_ancestor_hashes(&current_block, &ancestor_headers)?;
+    let parent = match ancestor_headers.last() {
+        Some(prev_header) => prev_header,
+        None => return Err(StatelessValidationError::MissingAncestorHeader),
+    };
+    validate_block_consensus(chain_spec.clone(), &current_block, parent)?;
+
+    let (endpoint_trie, bytecode) = T::new(&witness, parent.state_root)?;
+    let db = WitnessDatabase::new(&endpoint_trie, bytecode, ancestor_hashes);
+    let mut state = State::builder().with_database(db).with_bundle_update().build();
+
+    // ── drive tx-by-tx, snapshotting the cumulative root after each tx ──
+    let sealed = current_block.sealed_block();
+    let mut executor = evm_config
+        .executor_for_block(&mut state, sealed)
+        .map_err(|e| StatelessValidationError::StatelessExecutionFailed(format!("{e:?}")))?;
+    executor
+        .apply_pre_execution_changes()
+        .map_err(|e| StatelessValidationError::StatelessExecutionFailed(e.to_string()))?;
+
+    let mut tx_roots: Vec<B256> = Vec::new();
+    for tx in current_block.transactions_recovered() {
+        executor
+            .execute_transaction(tx)
+            .map_err(|e| StatelessValidationError::StatelessExecutionFailed(e.to_string()))?;
+        // Fold per-tx transitions into the cumulative bundle (Reverts kept so
+        // execution continues), snapshot it WITHOUT draining, and re-root from
+        // a FRESH trie (calculate_state_root mutates; the whole-block witness
+        // is a superset → has every prefix's nodes).
+        executor.evm_mut().db_mut().merge_transitions(BundleRetention::Reverts);
+        let bundle = executor.evm().db().bundle_state.clone();
+        let (mut snap_trie, _) = T::new(&witness, parent.state_root)?;
+        let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle.state);
+        tx_roots.push(snap_trie.calculate_state_root(hashed)?);
+    }
+
+    let result = executor
+        .finish()
+        .map_err(|e| StatelessValidationError::StatelessExecutionFailed(e.to_string()))?
+        .1;
+
+    // Post-execution consensus validation — receipts root, logs bloom,
+    // cumulative gas used, EIP-7685 requests hash — same as the
+    // whole-block path above. The state-root chain alone does not cover
+    // these header fields; omitting this would let a header lie about
+    // them while still "validating".
+    validate_block_post_execution(&current_block, &chain_spec, &result, None)
+        .map_err(StatelessValidationError::ConsensusValidationFailed)?;
+
+    // Endpoint: the last tx-root MUST equal the header's post-state root.
+    let final_root = tx_roots.last().copied().unwrap_or(parent.state_root);
+    if final_root != current_block.state_root {
+        return Err(StatelessValidationError::PostStateRootMismatch {
+            got: final_root,
+            expected: current_block.state_root,
+        });
+    }
+
+    // Per-tx receipt statuses: the consumer (eez-prover) refuses windows
+    // whose SYSTEM tx reverted — a reverted-but-sealed system tx passes
+    // every calldata-derived gate vacuously (the builder refuses to seal
+    // one, but a malicious builder might not).
+    let tx_statuses: Vec<bool> = result.receipts.iter().map(|r| r.success).collect();
+
+    // SOUNDNESS GUARD: trust mid-snapshots only when post-execution is a no-op.
+    let withdrawals_empty = sealed
+        .body()
+        .withdrawals
+        .as_ref()
+        .map_or(true, |w| w.is_empty());
+    if !result.requests.is_empty() || !withdrawals_empty {
+        return Ok((current_block.hash_slow(), Vec::new(), tx_statuses));
+    }
+
+    Ok((current_block.hash_slow(), tx_roots, tx_statuses))
 }
 
 fn validate_block_consensus<ChainSpec>(

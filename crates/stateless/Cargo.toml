@@ -34,8 +34,10 @@ reth-consensus.workspace = true
 
 # revm
 revm-bytecode.workspace = true
+revm-database.workspace = true
 revm-database-interface.workspace = true
 revm-state.workspace = true
+alloy-evm.workspace = true
 
 # misc
 thiserror.workspace = true
