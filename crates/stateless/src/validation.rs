@@ -344,6 +344,22 @@ where
         .apply_pre_execution_changes()
         .map_err(|e| StatelessValidationError::StatelessExecutionFailed(e.to_string()))?;
 
+    // EIP-2935 / EIP-4788 land their pre-block system writes in `state` via
+    // apply_pre_execution_changes (a CALL to the history / beacon-root
+    // contracts). Capture the post-pre-execution root NOW so a block with NO
+    // txs still reflects them: the per-tx snapshot loop below never runs for an
+    // empty block, so the endpoint would otherwise fall back to
+    // parent.state_root and silently drop the pre-block write (correct
+    // pre-Prague by coincidence — an empty block's root equalled the parent's —
+    // but WRONG once EIP-2935 is active and an empty block's root changes).
+    let pre_exec_root = {
+        executor.evm_mut().db_mut().merge_transitions(BundleRetention::Reverts);
+        let bundle = executor.evm().db().bundle_state.clone();
+        let (mut snap_trie, _) = T::new(&witness, parent.state_root)?;
+        let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(&bundle.state);
+        snap_trie.calculate_state_root(hashed)?
+    };
+
     let mut tx_roots: Vec<B256> = Vec::new();
     for tx in current_block.transactions_recovered() {
         executor
@@ -373,8 +389,10 @@ where
     validate_block_post_execution(&current_block, &chain_spec, &result, None)
         .map_err(StatelessValidationError::ConsensusValidationFailed)?;
 
-    // Endpoint: the last tx-root MUST equal the header's post-state root.
-    let final_root = tx_roots.last().copied().unwrap_or(parent.state_root);
+    // Endpoint: the last tx-root MUST equal the header's post-state root. For
+    // an empty block (no txs) fall back to the post-pre-execution root, not the
+    // parent root, so the EIP-2935 pre-block write is not dropped.
+    let final_root = tx_roots.last().copied().unwrap_or(pre_exec_root);
     if final_root != current_block.state_root {
         return Err(StatelessValidationError::PostStateRootMismatch {
             got: final_root,
